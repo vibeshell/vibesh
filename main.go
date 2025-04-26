@@ -3,7 +3,9 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
@@ -29,11 +31,13 @@ func (p *DirectShellProcessor) Process(command string, history []string) (string
 // AIProcessor represents a processor that uses AI to interpret commands
 type AIProcessor struct {
 	client *openai.Client
+	yolo   bool
 }
 
-func NewAIProcessor(apiKey string) *AIProcessor {
+func NewAIProcessor(apiKey string, yolo bool) *AIProcessor {
 	return &AIProcessor{
 		client: openai.NewClient(apiKey),
+		yolo:   yolo,
 	}
 }
 
@@ -94,10 +98,28 @@ func (p *AIProcessor) Process(command string, history []string) (string, error) 
 	// Get directory context
 	dirContext := getDirectoryContext()
 
-	// System message describing what we want
+	// System message describing what we want - updated to use the new format
+	systemPrompt := `You are VibeSH, an AI-powered natural-language shell assistant. When the user gives an instruction, you **do not** execute anything yourself. Instead:
+
+1. Interpret the user's intent.
+2. Determine the single most appropriate shell command (as an executable plus arguments) to fulfill it.
+3. Evaluate:
+   - **risk_score**: integer 0–10 based on potential data loss or system impact
+   - **does_read**: true if the command reads files or system state
+   - **does_write**: true if it creates, modifies, or deletes files or data
+4. Respond **only** with a JSON object in this exact schema (no extra fields, no comments, no prose outside the JSON):
+
+{
+  "reply": "string",         // One friendly sentence of what you will do
+  "cmd": ["string", "..."],  // Array: ["executable", "arg1", "arg2", …]
+  "risk_score": number,      // 0 (no risk) to 10 (extremely risky)
+  "does_read": boolean,      // true if it reads from disk, network, etc.
+  "does_write": boolean      // true if it writes/modifies/deletes data
+}`
+
 	messages = append(messages, openai.ChatCompletionMessage{
 		Role:    openai.ChatMessageRoleSystem,
-		Content: "You are an AI assistant helping with shell commands. Convert natural language requests into appropriate shell commands. Reply with the command only, no explanations.",
+		Content: systemPrompt,
 	})
 
 	// Add directory context
@@ -117,7 +139,7 @@ func (p *AIProcessor) Process(command string, history []string) (string, error) 
 	// Add the current command
 	messages = append(messages, openai.ChatCompletionMessage{
 		Role:    openai.ChatMessageRoleUser,
-		Content: "Convert to a shell command: " + command,
+		Content: command,
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -135,20 +157,58 @@ func (p *AIProcessor) Process(command string, history []string) (string, error) 
 		return "", fmt.Errorf("OpenAI API error: %v", err)
 	}
 
-	aiResponse := resp.Choices[0].Message.Content
+	aiResponseText := resp.Choices[0].Message.Content
 
-	// Execute the AI-generated command
-	shellCmd := exec.Command("sh", "-c", aiResponse)
-	shellOutput, shellErr := shellCmd.CombinedOutput()
-
-	result := fmt.Sprintf("[AI] Interpreted '%s' as:\n%s\n\nOutput:\n%s",
-		command, aiResponse, string(shellOutput))
-
-	if shellErr != nil {
-		result += fmt.Sprintf("\nError: %v", shellErr)
+	// Parse the JSON response
+	var aiResponse AICommandResponse
+	err = json.Unmarshal([]byte(aiResponseText), &aiResponse)
+	if err != nil {
+		return fmt.Sprintf("[AI] Error parsing AI response: %v\nRaw response: %s", err, aiResponseText), nil
 	}
 
-	return result, nil
+	// Build the shell command from the cmd array
+	shellCmd := strings.Join(aiResponse.Cmd, " ")
+
+	// Color formatting based on risk score
+	var riskColor string
+	if aiResponse.RiskScore >= 7 {
+		riskColor = "\033[1;31m" // Red for high risk
+	} else if aiResponse.RiskScore >= 4 {
+		riskColor = "\033[1;33m" // Yellow for medium risk
+	} else {
+		riskColor = "\033[1;32m" // Green for low risk
+	}
+
+	riskInfo := fmt.Sprintf("%sRisk: %d/10%s | Read: %v | Write: %v",
+		riskColor, aiResponse.RiskScore, "\033[0m", aiResponse.DoesRead, aiResponse.DoesWrite)
+
+	if p.yolo {
+		// In YOLO mode, just execute the command directly
+		cmd := exec.Command(aiResponse.Cmd[0], aiResponse.Cmd[1:]...)
+		output, err := cmd.CombinedOutput()
+
+		result := fmt.Sprintf("[AI YOLO] %s\n%s\nRunning: %s\n\nOutput:\n%s",
+			aiResponse.Reply, riskInfo, shellCmd, string(output))
+
+		if err != nil {
+			result += fmt.Sprintf("\nError: %v", err)
+		}
+
+		return result, nil
+	} else {
+		// Regular mode - show the command and ask for confirmation
+		shellExecCmd := exec.Command(aiResponse.Cmd[0], aiResponse.Cmd[1:]...)
+		shellOutput, shellErr := shellExecCmd.CombinedOutput()
+
+		result := fmt.Sprintf("[AI] %s\n%s\nCommand: %s\n\nOutput:\n%s",
+			aiResponse.Reply, riskInfo, shellCmd, string(shellOutput))
+
+		if shellErr != nil {
+			result += fmt.Sprintf("\nError: %v", shellErr)
+		}
+
+		return result, nil
+	}
 }
 
 // RAGProcessor represents a processor that uses retrieval-augmented generation
@@ -156,9 +216,10 @@ type RAGProcessor struct {
 	client *openai.Client
 	// Simple in-memory knowledge base for command examples
 	knowledgeBase map[string]string
+	yolo          bool
 }
 
-func NewRAGProcessor(apiKey string) *RAGProcessor {
+func NewRAGProcessor(apiKey string, yolo bool) *RAGProcessor {
 	// Initialize with some sample commands
 	kb := map[string]string{
 		// General file system commands
@@ -212,6 +273,7 @@ func NewRAGProcessor(apiKey string) *RAGProcessor {
 	return &RAGProcessor{
 		client:        openai.NewClient(apiKey),
 		knowledgeBase: kb,
+		yolo:          yolo,
 	}
 }
 
@@ -246,22 +308,36 @@ func (p *RAGProcessor) findSimilarCommand(query string) (string, bool) {
 func (p *RAGProcessor) Process(command string, history []string) (string, error) {
 	// Try to find a similar command in the knowledge base
 	if shellCmd, found := p.findSimilarCommand(command); found {
-		cmd := exec.Command("sh", "-c", shellCmd)
-		output, err := cmd.CombinedOutput()
+		if p.yolo {
+			// In YOLO mode, just execute without showing the matched command first
+			cmd := exec.Command("sh", "-c", shellCmd)
+			output, err := cmd.CombinedOutput()
 
-		result := fmt.Sprintf("[RAG] Matched '%s' to command: %s\n\nOutput:\n%s",
-			command, shellCmd, string(output))
+			result := fmt.Sprintf("[RAG YOLO] Running: %s\n\nOutput:\n%s",
+				shellCmd, string(output))
 
-		if err != nil {
-			result += fmt.Sprintf("\nError: %v", err)
-		}
+			if err != nil {
+				result += fmt.Sprintf("\nError: %v", err)
+			}
+
+			return result, nil
+		} else {
+			// Regular mode - show the command and execute
+			cmd := exec.Command("sh", "-c", shellCmd)
+			output, err := cmd.CombinedOutput()
+
+			result := fmt.Sprintf("[RAG] Matched '%s' to command: %s\n\nOutput:\n%s",
+				command, shellCmd, string(output))
+
+			if err != nil {
+				result += fmt.Sprintf("\nError: %v", err)
+			}
 
 		return result, nil
 	}
 
 	// If not found in knowledge base and we have a client, fall back to AI
 	if p.client != nil {
-		// Create a new AI processor with directory context
 		aiProcessor := AIProcessor{client: p.client}
 		return aiProcessor.Process(command, history)
 	}
@@ -269,13 +345,88 @@ func (p *RAGProcessor) Process(command string, history []string) (string, error)
 	return "[RAG] No matching command found and AI fallback not available.", nil
 }
 
+// processScriptFile reads and executes commands from a script file
+func processScriptFile(filename string, processor CommandProcessor) error {
+	file, err := os.Open(filename)
+	if err != nil {
+		return fmt.Errorf("failed to open script file: %v", err)
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+
+	// Skip the first line if it's a shebang
+	if scanner.Scan() {
+		firstLine := scanner.Text()
+		if !strings.HasPrefix(firstLine, "#!") {
+			// If it's not a shebang, process it as a command
+			output, err := processor.Process(firstLine, nil)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error executing command: %v\n", err)
+			} else {
+				fmt.Println(output)
+			}
+		}
+	}
+
+	// Process the rest of the file
+	var history []string
+	for scanner.Scan() {
+		line := scanner.Text()
+		line = strings.TrimSpace(line)
+
+		// Skip empty lines and comments
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		// Add to history for context
+		history = append(history, line)
+
+		// Process the command
+		output, err := processor.Process(line, history[:len(history)-1])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error executing command: %v\n", err)
+		} else {
+			fmt.Println(output)
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("error reading script file: %v", err)
+	}
+
+	return nil
+}
+
 func main() {
+	// Get OpenAI API key from environment
+	apiKey := os.Getenv("OPENAI_API_KEY")
+
+	// Create processors
+	aiProcessor := NewAIProcessor(apiKey, false)
+	ragProcessor := NewRAGProcessor(apiKey, false)
+	directProcessor := &DirectShellProcessor{}
+
+	// Check if a script file is provided as an argument
+	if len(os.Args) > 1 {
+		scriptFile := os.Args[1]
+
+		// Determine which processor to use based on script extension or content
+		// For simplicity, we'll use the AI processor by default for scripts
+		err := processScriptFile(scriptFile, aiProcessor)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Script execution failed: %v\n", err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+
+	// No script file, start interactive mode
 	fmt.Println("Vibesh - AI-Enhanced Interactive Shell")
 	fmt.Println("Type 'exit' to quit, 'mode' to switch processing mode, 'help' for available commands")
 	fmt.Println("Modes: 'direct' (default), 'ai', 'rag'")
 
-	// Get OpenAI API key from environment
-	apiKey := os.Getenv("OPENAI_API_KEY")
 	if apiKey == "" {
 		fmt.Println("Warning: OPENAI_API_KEY not set. AI and RAG modes will have limited functionality.")
 	}
@@ -284,18 +435,42 @@ func main() {
 	var commandHistory []string
 
 	processors := map[string]CommandProcessor{
-		"direct": &DirectShellProcessor{},
-		"ai":     NewAIProcessor(apiKey),
-		"rag":    NewRAGProcessor(apiKey),
+		"direct": directProcessor,
+		"ai":     aiProcessor,
+		"rag":    ragProcessor,
 	}
 
 	currentMode := "direct"
 
+	// Check for piped input - non-interactive mode
+	stat, _ := os.Stdin.Stat()
+	if (stat.Mode() & os.ModeCharDevice) == 0 {
+		// Data is being piped in
+		scanner := bufio.NewScanner(os.Stdin)
+		for scanner.Scan() {
+			command := scanner.Text()
+			processor := processors[currentMode]
+			output, err := processor.Process(command, commandHistory)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "Error executing command:", err)
+			} else {
+				fmt.Println(output)
+			}
+			commandHistory = append(commandHistory, command)
+		}
+		os.Exit(0)
+	}
+
+	// Interactive mode
 	for {
 		fmt.Printf("\033[1;32mvibesh(%s)>\033[0m ", currentMode)
 
 		input, err := reader.ReadString('\n')
 		if err != nil {
+			if err == io.EOF {
+				fmt.Println("\nGoodbye!")
+				break
+			}
 			fmt.Fprintln(os.Stderr, "Error reading input:", err)
 			continue
 		}
@@ -379,7 +554,7 @@ func printHelp(mode string) {
 	fmt.Println("  ai       - Natural language is converted to shell commands using AI")
 	fmt.Println("  rag      - Commands are matched against a knowledge base with AI fallback")
 
-	if mode == "rag" {
+	if strings.HasPrefix(mode, "rag") {
 		fmt.Println("\nPopular RAG Commands:")
 		fmt.Println("  list files               - List files in the current directory")
 		fmt.Println("  find file                - Find a file by name")
