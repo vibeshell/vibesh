@@ -18,6 +18,11 @@ Amplify your sysadmin powers by 1000x with an interactive shell that lets you ex
 * **Supernatural Speed** - YOLO modes for trusted environments where productivity matters most
 * **Learning Tool** - See the exact commands behind your natural language requests, leveling up your CLI skills
 
+# Disclaimer
+
+**In case this isn't obvious, this is very dangerous to run.**
+We included a devcontainer build so that you can test it, but running this on your actual computer could be _really bad_ (but it might be _really awesome_ too. Did you really need your root fs anyway?)
+
 ## Requirements
 
 - Go 1.16+ installed
