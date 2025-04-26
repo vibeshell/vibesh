@@ -28,62 +28,34 @@ func (p *DirectShellProcessor) Process(command string, history []string) (string
 	return string(output), err
 }
 
+// AIResponse represents the structured response from the AI
+type AIResponse struct {
+	Reply     string   `json:"reply"`      // Friendly explanation of what the command will do
+	Cmd       []string `json:"cmd"`        // Array of command and arguments
+	RiskScore int      `json:"risk_score"` // Risk score from 0-10
+	DoesRead  bool     `json:"does_read"`  // Whether the command reads from disk
+	DoesWrite bool     `json:"does_write"` // Whether the command writes to disk
+}
+
 // AIProcessor represents a processor that uses AI to interpret commands
 type AIProcessor struct {
 	client *openai.Client
-	yolo   bool
+	yolo   bool // Whether to execute commands without confirmation
 }
 
-func NewAIProcessor(apiKey string, yolo bool) *AIProcessor {
+func NewAIProcessor(apiKey string) *AIProcessor {
 	return &AIProcessor{
 		client: openai.NewClient(apiKey),
-		yolo:   yolo,
+		yolo:   false,
 	}
 }
 
-// getDirectoryContext gets information about the current directory for context
-func getDirectoryContext() string {
-	// Get current working directory
-	cwd, err := os.Getwd()
-	if err != nil {
-		return "Error getting current directory"
+// NewAIYoloProcessor creates an AI processor that executes commands without confirmation
+func NewAIYoloProcessor(apiKey string) *AIProcessor {
+	return &AIProcessor{
+		client: openai.NewClient(apiKey),
+		yolo:   true,
 	}
-
-	// List files in the current directory
-	files, err := os.ReadDir(".")
-	if err != nil {
-		return fmt.Sprintf("Current directory: %s\nError listing files", cwd)
-	}
-
-	// Format directory contents
-	var fileList strings.Builder
-	dirCount := 0
-	fileCount := 0
-
-	fileList.WriteString(fmt.Sprintf("Current directory: %s\n\nContents:\n", cwd))
-	for _, file := range files {
-		if file.IsDir() {
-			dirCount++
-			fileList.WriteString(fmt.Sprintf("- [DIR] %s\n", file.Name()))
-		} else {
-			fileCount++
-			// Only include first 20 files to avoid too much content
-			if fileCount <= 20 {
-				info, _ := file.Info()
-				size := info.Size()
-				fileList.WriteString(fmt.Sprintf("- [FILE] %s (%d bytes)\n", file.Name(), size))
-			}
-		}
-	}
-
-	if fileCount > 20 {
-		fileList.WriteString(fmt.Sprintf("... and %d more files\n", fileCount-20))
-	}
-
-	summary := fmt.Sprintf("\nSummary: %d directories, %d files\n", dirCount, fileCount)
-	fileList.WriteString(summary)
-
-	return fileList.String()
 }
 
 func (p *AIProcessor) Process(command string, history []string) (string, error) {
@@ -98,8 +70,8 @@ func (p *AIProcessor) Process(command string, history []string) (string, error) 
 	// Get directory context
 	dirContext := getDirectoryContext()
 
-	// System message describing what we want - updated to use the new format
-	systemPrompt := `You are VibeSH, an AI-powered natural-language shell assistant. When the user gives an instruction, you **do not** execute anything yourself. Instead:
+	// System message describing what we want - updated to prompt for JSON
+	systemPrompt := `You are ShellAI, an AI-powered natural-language shell assistant. When the user gives an instruction, you **do not** execute anything yourself. Instead:
 
 1. Interpret the user's intent.
 2. Determine the single most appropriate shell command (as an executable plus arguments) to fulfill it.
@@ -142,14 +114,57 @@ func (p *AIProcessor) Process(command string, history []string) (string, error) 
 		Content: command,
 	})
 
+	// Setup JSON response format with function calling
+	functions := []openai.FunctionDefinition{
+		{
+			Name:        "generate_shell_command",
+			Description: "Generate a shell command based on user input",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"reply": map[string]interface{}{
+						"type":        "string",
+						"description": "One friendly sentence of what you will do",
+					},
+					"cmd": map[string]interface{}{
+						"type":        "array",
+						"description": "Array: [\"executable\", \"arg1\", \"arg2\", …]",
+						"items": map[string]interface{}{
+							"type": "string",
+						},
+					},
+					"risk_score": map[string]interface{}{
+						"type":        "integer",
+						"description": "0 (no risk) to 10 (extremely risky)",
+						"minimum":     0,
+						"maximum":     10,
+					},
+					"does_read": map[string]interface{}{
+						"type":        "boolean",
+						"description": "true if it reads from disk, network, etc.",
+					},
+					"does_write": map[string]interface{}{
+						"type":        "boolean",
+						"description": "true if it writes/modifies/deletes data",
+					},
+				},
+				"required": []string{"reply", "cmd", "risk_score", "does_read", "does_write"},
+			},
+		},
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	resp, err := p.client.CreateChatCompletion(
 		ctx,
 		openai.ChatCompletionRequest{
-			Model:    openai.GPT3Dot5Turbo,
-			Messages: messages,
+			Model:       openai.GPT3Dot5Turbo,
+			Messages:    messages,
+			Functions:   functions,
+			FunctionCall: openai.FunctionCall{
+				Name: "generate_shell_command",
+			},
 		},
 	)
 
@@ -157,57 +172,106 @@ func (p *AIProcessor) Process(command string, history []string) (string, error) 
 		return "", fmt.Errorf("OpenAI API error: %v", err)
 	}
 
-	aiResponseText := resp.Choices[0].Message.Content
+	// Extract the function call response
+	functionCallResponse := resp.Choices[0].Message.FunctionCall
 
-	// Parse the JSON response
-	var aiResponse AICommandResponse
-	err = json.Unmarshal([]byte(aiResponseText), &aiResponse)
-	if err != nil {
-		return fmt.Sprintf("[AI] Error parsing AI response: %v\nRaw response: %s", err, aiResponseText), nil
+	// Parse the JSON response from the function call
+	var aiResponse AIResponse
+	if err := json.Unmarshal([]byte(functionCallResponse.Arguments), &aiResponse); err != nil {
+		return "", fmt.Errorf("Failed to parse AI response as JSON: %v\nRaw response: %s", err, functionCallResponse.Arguments)
 	}
 
-	// Build the shell command from the cmd array
-	shellCmd := strings.Join(aiResponse.Cmd, " ")
+	// Convert the command array to a shell command string
+	shellCmdString := strings.Join(aiResponse.Cmd, " ")
 
-	// Color formatting based on risk score
-	var riskColor string
-	if aiResponse.RiskScore >= 7 {
-		riskColor = "\033[1;31m" // Red for high risk
-	} else if aiResponse.RiskScore >= 4 {
-		riskColor = "\033[1;33m" // Yellow for medium risk
-	} else {
-		riskColor = "\033[1;32m" // Green for low risk
+	// Get risk color based on risk score
+	riskColor := getRiskColor(aiResponse.RiskScore)
+
+	// Determine if we should ask for confirmation based on risk score and YOLO mode
+	shouldConfirm := aiResponse.RiskScore >= 7 && !p.yolo
+
+	// Format result with risk information
+	formatTags := []string{
+		fmt.Sprintf("Risk: %s%d/10\033[0m", riskColor, aiResponse.RiskScore),
+		fmt.Sprintf("Read: %v", aiResponse.DoesRead),
+		fmt.Sprintf("Write: %v", aiResponse.DoesWrite),
 	}
 
-	riskInfo := fmt.Sprintf("%sRisk: %d/10%s | Read: %v | Write: %v",
-		riskColor, aiResponse.RiskScore, "\033[0m", aiResponse.DoesRead, aiResponse.DoesWrite)
+	// Build the output
+	var result strings.Builder
 
+	// Add mode prefix with YOLO warning if applicable
 	if p.yolo {
-		// In YOLO mode, just execute the command directly
-		cmd := exec.Command(aiResponse.Cmd[0], aiResponse.Cmd[1:]...)
-		output, err := cmd.CombinedOutput()
-
-		result := fmt.Sprintf("[AI YOLO] %s\n%s\nRunning: %s\n\nOutput:\n%s",
-			aiResponse.Reply, riskInfo, shellCmd, string(output))
-
-		if err != nil {
-			result += fmt.Sprintf("\nError: %v", err)
-		}
-
-		return result, nil
+		result.WriteString("[AI YOLO] ")
 	} else {
-		// Regular mode - show the command and ask for confirmation
-		shellExecCmd := exec.Command(aiResponse.Cmd[0], aiResponse.Cmd[1:]...)
-		shellOutput, shellErr := shellExecCmd.CombinedOutput()
+		result.WriteString("[AI] ")
+	}
 
-		result := fmt.Sprintf("[AI] %s\n%s\nCommand: %s\n\nOutput:\n%s",
-			aiResponse.Reply, riskInfo, shellCmd, string(shellOutput))
+	// Add the friendly explanation
+	result.WriteString(aiResponse.Reply)
+	result.WriteString("\n")
 
-		if shellErr != nil {
-			result += fmt.Sprintf("\nError: %v", shellErr)
+	// Add the risk information
+	result.WriteString(strings.Join(formatTags, " | "))
+	result.WriteString("\n")
+
+	// Check if we need confirmation
+	if shouldConfirm {
+		result.WriteString(fmt.Sprintf("\033[1;31mWARNING: This command has a high risk score (%d/10).\033[0m\n", aiResponse.RiskScore))
+		result.WriteString(fmt.Sprintf("Command: %s\n\n", shellCmdString))
+		result.WriteString("Do you want to execute this command? (y/n): ")
+
+		// Print the current result and get user confirmation
+		fmt.Print(result.String())
+		reader := bufio.NewReader(os.Stdin)
+		confirm, _ := reader.ReadString('\n')
+		confirm = strings.TrimSpace(confirm)
+
+		// Reset the result for the final output
+		result.Reset()
+
+		if strings.ToLower(confirm) != "y" {
+			return "Command execution cancelled by user.", nil
 		}
 
-		return result, nil
+		// Rebuild the prefix for the final output
+		if p.yolo {
+			result.WriteString("[AI YOLO] ")
+		} else {
+			result.WriteString("[AI] ")
+		}
+	}
+
+	// Execute the command
+	if p.yolo {
+		result.WriteString(fmt.Sprintf("Running: %s\n\n", shellCmdString))
+	} else {
+		result.WriteString(fmt.Sprintf("Command: %s\n\n", shellCmdString))
+	}
+
+	// Execute the command
+	cmd := exec.Command("sh", "-c", shellCmdString)
+	shellOutput, shellErr := cmd.CombinedOutput()
+
+	// Add the command output
+	result.WriteString(string(shellOutput))
+
+	// Add any error information
+	if shellErr != nil {
+		result.WriteString(fmt.Sprintf("\nError: %v", shellErr))
+	}
+
+	return result.String(), nil
+}
+
+// getRiskColor returns ANSI color code based on the risk score
+func getRiskColor(risk int) string {
+	if risk <= 3 {
+		return "\033[1;32m" // Green for low risk
+	} else if risk <= 6 {
+		return "\033[1;33m" // Yellow for medium risk
+	} else {
+		return "\033[1;31m" // Red for high risk
 	}
 }
 
@@ -216,10 +280,10 @@ type RAGProcessor struct {
 	client *openai.Client
 	// Simple in-memory knowledge base for command examples
 	knowledgeBase map[string]string
-	yolo          bool
+	yolo          bool // Whether to execute commands without confirmation
 }
 
-func NewRAGProcessor(apiKey string, yolo bool) *RAGProcessor {
+func NewRAGProcessor(apiKey string) *RAGProcessor {
 	// Initialize with some sample commands
 	kb := map[string]string{
 		// General file system commands
@@ -273,8 +337,55 @@ func NewRAGProcessor(apiKey string, yolo bool) *RAGProcessor {
 	return &RAGProcessor{
 		client:        openai.NewClient(apiKey),
 		knowledgeBase: kb,
-		yolo:          yolo,
+		yolo:          false,
 	}
+}
+
+// NewRAGYoloProcessor creates a RAG processor that executes commands without confirmation
+func NewRAGYoloProcessor(apiKey string) *RAGProcessor {
+	processor := NewRAGProcessor(apiKey)
+	processor.yolo = true
+	return processor
+}
+
+// Assign estimated risk scores to common RAG commands
+func getRAGCommandRisk(cmd string) (int, bool, bool) {
+	// Default values
+	risk := 3 // Medium-low risk by default
+	doesRead := true
+	doesWrite := false
+
+	// High-risk commands
+	if strings.HasPrefix(cmd, "rm -rf") {
+		risk = 9
+		doesWrite = true
+	} else if strings.HasPrefix(cmd, "chmod") || strings.HasPrefix(cmd, "chown") {
+		risk = 7
+		doesWrite = true
+	}
+
+	// Medium-risk commands
+	if strings.HasPrefix(cmd, "git push") || strings.HasPrefix(cmd, "git pull") {
+		risk = 5
+		doesWrite = true
+	} else if strings.HasPrefix(cmd, "mv") || strings.HasPrefix(cmd, "cp") {
+		risk = 5
+		doesWrite = true
+	} else if strings.HasPrefix(cmd, "mkdir") {
+		risk = 4
+		doesWrite = true
+	}
+
+	// Low-risk commands (read-only)
+	if strings.HasPrefix(cmd, "ls") || strings.HasPrefix(cmd, "find") ||
+	   strings.HasPrefix(cmd, "grep") || strings.HasPrefix(cmd, "df") ||
+	   strings.HasPrefix(cmd, "ps") || strings.HasPrefix(cmd, "uname") ||
+	   strings.HasPrefix(cmd, "git status") {
+		risk = 1
+		doesWrite = false
+	}
+
+	return risk, doesRead, doesWrite
 }
 
 func (p *RAGProcessor) findSimilarCommand(query string) (string, bool) {
@@ -308,41 +419,134 @@ func (p *RAGProcessor) findSimilarCommand(query string) (string, bool) {
 func (p *RAGProcessor) Process(command string, history []string) (string, error) {
 	// Try to find a similar command in the knowledge base
 	if shellCmd, found := p.findSimilarCommand(command); found {
+		// Get risk assessment for this command
+		riskScore, doesRead, doesWrite := getRAGCommandRisk(shellCmd)
+
+		// Get risk color
+		riskColor := getRiskColor(riskScore)
+
+		// Determine if we should ask for confirmation
+		shouldConfirm := riskScore >= 7 && !p.yolo
+
+		// Format result with risk information
+		formatTags := []string{
+			fmt.Sprintf("Risk: %s%d/10\033[0m", riskColor, riskScore),
+			fmt.Sprintf("Read: %v", doesRead),
+			fmt.Sprintf("Write: %v", doesWrite),
+		}
+
+		// Build the output
+		var result strings.Builder
+
+		// Add mode prefix with YOLO warning if applicable
 		if p.yolo {
-			// In YOLO mode, just execute without showing the matched command first
-			cmd := exec.Command("sh", "-c", shellCmd)
-			output, err := cmd.CombinedOutput()
-
-			result := fmt.Sprintf("[RAG YOLO] Running: %s\n\nOutput:\n%s",
-				shellCmd, string(output))
-
-			if err != nil {
-				result += fmt.Sprintf("\nError: %v", err)
-			}
-
-			return result, nil
+			result.WriteString("[RAG YOLO] ")
 		} else {
-			// Regular mode - show the command and execute
-			cmd := exec.Command("sh", "-c", shellCmd)
-			output, err := cmd.CombinedOutput()
+			result.WriteString("[RAG] ")
+		}
 
-			result := fmt.Sprintf("[RAG] Matched '%s' to command: %s\n\nOutput:\n%s",
-				command, shellCmd, string(output))
+		// Add matched information
+		result.WriteString(fmt.Sprintf("Matched '%s' to command: %s\n", command, shellCmd))
 
-			if err != nil {
-				result += fmt.Sprintf("\nError: %v", err)
+		// Add the risk information
+		result.WriteString(strings.Join(formatTags, " | "))
+		result.WriteString("\n")
+
+		// Check if we need confirmation
+		if shouldConfirm {
+			result.WriteString(fmt.Sprintf("\033[1;31mWARNING: This command has a high risk score (%d/10).\033[0m\n", riskScore))
+			result.WriteString("Do you want to execute this command? (y/n): ")
+
+			// Print the current result and get user confirmation
+			fmt.Print(result.String())
+			reader := bufio.NewReader(os.Stdin)
+			confirm, _ := reader.ReadString('\n')
+			confirm = strings.TrimSpace(confirm)
+
+			// Reset the result for the final output
+			result.Reset()
+
+			if strings.ToLower(confirm) != "y" {
+				return "Command execution cancelled by user.", nil
 			}
 
-		return result, nil
+			// Rebuild the prefix for the final output
+			if p.yolo {
+				result.WriteString("[RAG YOLO] ")
+			} else {
+				result.WriteString("[RAG] ")
+			}
+			result.WriteString(fmt.Sprintf("Matched '%s' to command: %s\n", command, shellCmd))
+		}
+
+		// Execute the command
+		cmd := exec.Command("sh", "-c", shellCmd)
+		output, err := cmd.CombinedOutput()
+
+		// Add output information
+		result.WriteString("\nOutput:\n")
+		result.WriteString(string(output))
+
+		// Add error information if any
+		if err != nil {
+			result.WriteString(fmt.Sprintf("\nError: %v", err))
+		}
+
+		return result.String(), nil
 	}
 
 	// If not found in knowledge base and we have a client, fall back to AI
 	if p.client != nil {
-		aiProcessor := AIProcessor{client: p.client}
+		aiProcessor := AIProcessor{client: p.client, yolo: p.yolo}
 		return aiProcessor.Process(command, history)
 	}
 
 	return "[RAG] No matching command found and AI fallback not available.", nil
+}
+
+// getDirectoryContext gets information about the current directory for context
+func getDirectoryContext() string {
+	// Get current working directory
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "Error getting current directory"
+	}
+
+	// List files in the current directory
+	files, err := os.ReadDir(".")
+	if err != nil {
+		return fmt.Sprintf("Current directory: %s\nError listing files", cwd)
+	}
+
+	// Format directory contents
+	var fileList strings.Builder
+	dirCount := 0
+	fileCount := 0
+
+	fileList.WriteString(fmt.Sprintf("Current directory: %s\n\nContents:\n", cwd))
+	for _, file := range files {
+		if file.IsDir() {
+			dirCount++
+			fileList.WriteString(fmt.Sprintf("- [DIR] %s\n", file.Name()))
+		} else {
+			fileCount++
+			// Only include first 20 files to avoid too much content
+			if fileCount <= 20 {
+				info, _ := file.Info()
+				size := info.Size()
+				fileList.WriteString(fmt.Sprintf("- [FILE] %s (%d bytes)\n", file.Name(), size))
+			}
+		}
+	}
+
+	if fileCount > 20 {
+		fileList.WriteString(fmt.Sprintf("... and %d more files\n", fileCount-20))
+	}
+
+	summary := fmt.Sprintf("\nSummary: %d directories, %d files\n", dirCount, fileCount)
+	fileList.WriteString(summary)
+
+	return fileList.String()
 }
 
 // processScriptFile reads and executes commands from a script file
@@ -404,8 +608,10 @@ func main() {
 	apiKey := os.Getenv("OPENAI_API_KEY")
 
 	// Create processors
-	aiProcessor := NewAIProcessor(apiKey, false)
-	ragProcessor := NewRAGProcessor(apiKey, false)
+	aiProcessor := NewAIProcessor(apiKey)
+	aiYoloProcessor := NewAIYoloProcessor(apiKey)
+	ragProcessor := NewRAGProcessor(apiKey)
+	ragYoloProcessor := NewRAGYoloProcessor(apiKey)
 	directProcessor := &DirectShellProcessor{}
 
 	// Check if a script file is provided as an argument
@@ -425,7 +631,7 @@ func main() {
 	// No script file, start interactive mode
 	fmt.Println("Vibesh - AI-Enhanced Interactive Shell")
 	fmt.Println("Type 'exit' to quit, 'mode' to switch processing mode, 'help' for available commands")
-	fmt.Println("Modes: 'direct' (default), 'ai', 'rag'")
+	fmt.Println("Modes: 'direct' (default), 'ai', 'rag', 'ai-yolo', 'rag-yolo'")
 
 	if apiKey == "" {
 		fmt.Println("Warning: OPENAI_API_KEY not set. AI and RAG modes will have limited functionality.")
@@ -435,9 +641,11 @@ func main() {
 	var commandHistory []string
 
 	processors := map[string]CommandProcessor{
-		"direct": directProcessor,
-		"ai":     aiProcessor,
-		"rag":    ragProcessor,
+		"direct":   directProcessor,
+		"ai":       aiProcessor,
+		"rag":      ragProcessor,
+		"ai-yolo":  aiYoloProcessor,
+		"rag-yolo": ragYoloProcessor,
 	}
 
 	currentMode := "direct"
@@ -463,7 +671,13 @@ func main() {
 
 	// Interactive mode
 	for {
-		fmt.Printf("\033[1;32mvibesh(%s)>\033[0m ", currentMode)
+		// Set prompt color - use red for YOLO modes
+		promptColor := "\033[1;32m" // Green
+		if strings.HasSuffix(currentMode, "-yolo") {
+			promptColor = "\033[1;31m" // Red for YOLO modes
+		}
+
+		fmt.Printf("%svibesh(%s)>\033[0m ", promptColor, currentMode)
 
 		input, err := reader.ReadString('\n')
 		if err != nil {
@@ -495,21 +709,51 @@ func main() {
 			continue
 		}
 
-		if input == "mode" {
-			fmt.Printf("Current mode: %s\nAvailable modes: direct, ai, rag\n", currentMode)
-			fmt.Print("Select mode: ")
-			modeInput, err := reader.ReadString('\n')
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "Error reading mode:", err)
-				continue
-			}
+		// Handle mode command with or without argument
+		if strings.HasPrefix(input, "mode") {
+			parts := strings.Fields(input)
 
-			modeInput = strings.TrimSpace(modeInput)
-			if _, ok := processors[modeInput]; ok {
-				currentMode = modeInput
-				fmt.Printf("Mode switched to: %s\n", currentMode)
+			// Show current mode and available modes if no argument is provided
+			if len(parts) == 1 {
+				fmt.Printf("Current mode: %s\nAvailable modes: direct, ai, rag, ai-yolo, rag-yolo\n", currentMode)
+				fmt.Print("Select mode: ")
+				modeInput, err := reader.ReadString('\n')
+				if err != nil {
+					fmt.Fprintln(os.Stderr, "Error reading mode:", err)
+					continue
+				}
+
+				modeInput = strings.TrimSpace(modeInput)
+				if _, ok := processors[modeInput]; ok {
+					currentMode = modeInput
+
+					// Add warning when switching to YOLO mode
+					if strings.HasSuffix(currentMode, "-yolo") {
+						fmt.Printf("\033[1;31m⚠️  CAUTION: YOLO MODE EXECUTES COMMANDS WITHOUT CONFIRMATION\033[0m\n")
+					}
+
+					fmt.Printf("Mode switched to: %s\n", currentMode)
+				} else {
+					fmt.Printf("Invalid mode: %s\n", modeInput)
+				}
+			} else if len(parts) == 2 {
+				// If an argument is provided, try to switch to that mode directly
+				modeInput := parts[1]
+				if _, ok := processors[modeInput]; ok {
+					currentMode = modeInput
+
+					// Add warning when switching to YOLO mode
+					if strings.HasSuffix(currentMode, "-yolo") {
+						fmt.Printf("\033[1;31m⚠️  CAUTION: YOLO MODE EXECUTES COMMANDS WITHOUT CONFIRMATION\033[0m\n")
+					}
+
+					fmt.Printf("Mode switched to: %s\n", currentMode)
+				} else {
+					fmt.Printf("Invalid mode: %s\nAvailable modes: direct, ai, rag, ai-yolo, rag-yolo\n", modeInput)
+				}
 			} else {
-				fmt.Printf("Invalid mode: %s\n", modeInput)
+				fmt.Println("Usage: mode [mode_name]")
+				fmt.Println("Available modes: direct, ai, rag, ai-yolo, rag-yolo")
 			}
 			continue
 		}
@@ -545,7 +789,7 @@ func printHelp(mode string) {
 	fmt.Println("---------------")
 	fmt.Println("Built-in commands:")
 	fmt.Println("  exit     - Exit the shell")
-	fmt.Println("  mode     - Switch between processing modes")
+	fmt.Println("  mode [mode_name] - Switch processing mode. With no argument, it prompts for mode selection")
 	fmt.Println("  history  - Display command history")
 	fmt.Println("  context  - Show current directory context")
 	fmt.Println("  help     - Display this help message")
@@ -553,6 +797,8 @@ func printHelp(mode string) {
 	fmt.Println("  direct   - Commands are executed directly in the shell")
 	fmt.Println("  ai       - Natural language is converted to shell commands using AI")
 	fmt.Println("  rag      - Commands are matched against a knowledge base with AI fallback")
+	fmt.Println("  ai-yolo  - Like AI mode but executes commands directly without confirmation")
+	fmt.Println("  rag-yolo - Like RAG mode but executes commands directly without confirmation")
 
 	if strings.HasPrefix(mode, "rag") {
 		fmt.Println("\nPopular RAG Commands:")

@@ -96,14 +96,14 @@ Vibesh can be run inside a DevContainer for an isolated development environment:
 ### Available commands
 
 - `exit` - Exit the shell
-- `mode` - Switch between processing modes (direct, ai, rag, ai-yolo, rag-yolo)
+- `mode [mode_name]` - Switch processing mode. Without an argument, it prompts for mode selection. With an argument, directly switches to the specified mode (e.g., `mode ai`)
 - `history` - Display command history
 - `context` - Show current directory context information
 - `help` - Display help information
 
 ### AI Command Risk Assessment
 
-Vibesh now includes risk assessment for AI-generated commands:
+Vibesh provides automatic risk assessment for AI-generated commands:
 
 - **Risk Score**: Commands are rated on a scale from 0-10 based on potential for data loss or system impact
 - **Read/Write Classification**: Commands are identified as reading from or writing to disk
@@ -112,7 +112,18 @@ Vibesh now includes risk assessment for AI-generated commands:
   - Yellow (4-6): Medium risk
   - Red (7-10): High risk
 
-This helps you quickly identify potentially dangerous commands before execution.
+High-risk commands (score ≥ 7) will trigger a confirmation prompt before execution, allowing you to review and approve potentially dangerous operations.
+
+### Intelligent Risk Management
+
+Vibesh now intelligently manages command execution risk:
+
+1. Low-risk commands (0-3) execute immediately with visual risk indication
+2. Medium-risk commands (4-6) execute with visual warnings
+3. High-risk commands (7-10) require explicit confirmation before execution
+4. Commands in YOLO modes bypass confirmation regardless of risk level
+
+The shell provides clear feedback about command risk through color-coding and detailed risk information, helping you make informed decisions about command execution.
 
 ### YOLO Mode
 
@@ -122,7 +133,7 @@ YOLO ("You Only Live Once") modes execute commands directly without showing you 
 - Commands are executed immediately without confirmation
 - The output shows what command was run after execution
 
-⚠️ **CAUTION:** YOLO modes should be used with care, as they execute commands without giving you a chance to review them first.
+⚠️ **CAUTION:** YOLO modes should be used with care, as they execute commands without giving you a chance to review them first, even for high-risk operations.
 
 ### Directory Context Feature
 
@@ -140,10 +151,7 @@ Modes: 'direct' (default), 'ai', 'rag', 'ai-yolo', 'rag-yolo'
 vibesh(direct)> ls -la
 [Output of ls -la command]
 
-vibesh(direct)> mode
-Current mode: direct
-Available modes: direct, ai, rag, ai-yolo, rag-yolo
-Select mode: ai
+vibesh(direct)> mode ai
 Mode switched to: ai
 
 vibesh(ai)> show me all Go files
@@ -154,12 +162,20 @@ Command: find . -name "*.go"
 Output:
 ./main.go
 
-vibesh(ai)> mode
-Current mode: ai
-Available modes: direct, ai, rag, ai-yolo, rag-yolo
-Select mode: ai-yolo
+vibesh(ai)> delete all temporary files
+[AI] I'll remove all temporary files in the current directory.
+Risk: 7/10 | Read: true | Write: true
+WARNING: This command has a high risk score (7/10).
+Command: find . -name "*~" -o -name "*.tmp" -delete
+
+Do you want to execute this command? (y/n): y
+
+Output:
+[Command output]
+
+vibesh(ai)> mode ai-yolo
 Mode switched to: ai-yolo
-⚠️  CAUTION: YOLO MODE EXECUTES COMMANDS WITHOUT CONFIRMATION
+⚠️ CAUTION: YOLO MODE EXECUTES COMMANDS WITHOUT CONFIRMATION
 
 vibesh(ai-yolo)> delete all temporary files
 [AI YOLO] I'll remove all temporary files in the current directory.
@@ -177,13 +193,32 @@ Output:
 3. **RAG mode**: Attempts to match your request against a knowledge base of common commands. If no match is found, falls back to AI processing.
 4. **YOLO modes**: The AI/RAG-YOLO modes execute commands immediately without showing you the command first.
 
-The AI generates structured responses with:
+### OpenAI Function Calling API
+
+Vibesh leverages OpenAI's Function Calling API to ensure well-structured, reliable command generation:
+
+1. Your natural language request is sent to the OpenAI API
+2. A specially designed function schema instructs the AI model to:
+   - Generate a proper command array
+   - Provide a friendly explanation
+   - Assess risk level (0-10)
+   - Identify read/write operations
+3. The JSON response follows a strict schema, ensuring consistent parsing and risk assessment
+4. Vibesh validates and executes the command based on risk level and mode
+
+This approach provides several advantages:
+- More reliable parsing of AI responses
+- Consistent risk assessment
+- Better structured command generation
+- Improved error handling
+
+The structured JSON responses contain:
 - A friendly explanation of what the command will do
 - The exact command broken down into executable and arguments
 - Risk assessment scoring
 - Classification of whether the command reads or writes data
 
-This structured approach allows Vibesh to provide better safety information and more accurate command execution.
+This structured approach allows Vibesh to provide better safety information and more accurate command execution, while giving you control over how commands are confirmed based on their risk level.
 
 ## Script Writing Guide
 

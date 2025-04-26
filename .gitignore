@@ -19,4 +19,4 @@ vibesh
 go.work
 
 # Environment files that might contain API keys
-.env
+.env*
